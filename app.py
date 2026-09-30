@@ -104,23 +104,16 @@ ADMIN_USERNAME = os.getenv(
 # ADMIN PASSWORD
 # ================================================================
 #
-# The real password is never stored in the code. It must be set
-# as an environment variable named EDUTEXT_ADMIN_PASSWORD on
-# whichever platform you deploy to. If it is missing, the app
-# will refuse to start rather than fall back to an insecure
-# default.
+# TRIAL / TEMPORARY: hardcoded for quick testing. Before any real
+# deployment, replace this with an environment variable
+# (EDUTEXT_ADMIN_PASSWORD) so the password isn't stored in the
+# code or visible in your GitHub repo.
 # ================================================================
 
 ADMIN_PASSWORD = os.getenv(
-    "EDUTEXT_ADMIN_PASSWORD"
+    "EDUTEXT_ADMIN_PASSWORD",
+    "Egr58MFe"
 )
-
-if not ADMIN_PASSWORD:
-    raise RuntimeError(
-        "EDUTEXT_ADMIN_PASSWORD environment variable is not set. "
-        "Set it in your deployment platform's environment "
-        "variables before starting the app."
-    )
 
 ADMIN_PASSWORD_HASH = generate_password_hash(
     ADMIN_PASSWORD
@@ -4047,7 +4040,7 @@ def test():
 
                 <a
                     class="subject"
-                    href="/test?from={phone}&text={key}"
+                    href="/test?text={key}"
                 >
 
                     <div class="number">
@@ -4126,7 +4119,7 @@ def test():
 
                 <a
                     class="button"
-                    href="/test?from={phone}&text=START"
+                    href="/test?text=START"
                 >
                     Choose Another Subject
                 </a>
@@ -4204,7 +4197,7 @@ def test():
                     <a
                         id="startQuiz"
                         class="button"
-                        href="/test?from={phone}&text=1"
+                        href="/test?text=1"
                     >
                         Start Quiz
                     </a>
@@ -4318,7 +4311,7 @@ def test():
 
                 <a
                     class="button"
-                    href="/test?from={phone}&text=START"
+                    href="/test?text=START"
                 >
                     Start New Session
                 </a>
@@ -4387,8 +4380,7 @@ def test():
         if not selected:
 
             href = (
-                f"/test?from={phone}"
-                f"&text={key}"
+                f"/test?text={key}"
             )
 
         options_html += f"""
@@ -4445,7 +4437,7 @@ def test():
 
         <a
             class="hint-button"
-            href="/test?from={phone}&text=HINT"
+            href="/test?text=HINT"
         >
             {hint_text}
         </a>
@@ -4500,7 +4492,7 @@ def test():
 
             <a
                 class="button"
-                href="/test?from={phone}&text=NEXT"
+                href="/test?text=NEXT"
             >
                 Next Question
             </a>
@@ -4513,7 +4505,7 @@ def test():
 
             <a
                 class="button"
-                href="/test?from={phone}&text=SKIP"
+                href="/test?text=SKIP"
             >
                 Skip Question
             </a>
