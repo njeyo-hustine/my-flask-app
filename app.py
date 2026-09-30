@@ -103,8 +103,24 @@ ADMIN_USERNAME = os.getenv(
 # ================================================================
 # ADMIN PASSWORD
 # ================================================================
+#
+# The real password is never stored in the code. It must be set
+# as an environment variable named EDUTEXT_ADMIN_PASSWORD on
+# whichever platform you deploy to. If it is missing, the app
+# will refuse to start rather than fall back to an insecure
+# default.
+# ================================================================
 
-ADMIN_PASSWORD = "Egr58MFe"
+ADMIN_PASSWORD = os.getenv(
+    "EDUTEXT_ADMIN_PASSWORD"
+)
+
+if not ADMIN_PASSWORD:
+    raise RuntimeError(
+        "EDUTEXT_ADMIN_PASSWORD environment variable is not set. "
+        "Set it in your deployment platform's environment "
+        "variables before starting the app."
+    )
 
 ADMIN_PASSWORD_HASH = generate_password_hash(
     ADMIN_PASSWORD
@@ -130,6 +146,36 @@ def admin_required(function):
             return redirect(
                 url_for(
                     "admin_login"
+                )
+            )
+
+        return function(
+            *args,
+            **kwargs
+        )
+
+    return decorated_function
+
+
+# ================================================================
+# STUDENT AUTHENTICATION DECORATOR
+# ================================================================
+
+def student_login_required(function):
+
+    @wraps(function)
+    def decorated_function(
+        *args,
+        **kwargs
+    ):
+
+        if not session.get(
+            "student_phone"
+        ):
+
+            return redirect(
+                url_for(
+                    "student_login"
                 )
             )
 
@@ -232,6 +278,22 @@ class Database:
                 )
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS students (
+
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                    name TEXT NOT NULL,
+
+                    phone_number TEXT NOT NULL UNIQUE,
+
+                    password_hash TEXT NOT NULL,
+
+                    created_at TIMESTAMP NOT NULL
+
+                )
+            """)
+
             conn.commit()
 
 
@@ -242,6 +304,95 @@ class Database:
 database = Database(
     DATABASE_NAME
 )
+
+
+# ================================================================
+# STUDENT ACCOUNTS
+# ================================================================
+
+def get_student_by_phone(phone_number):
+
+    with database.connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT id, name, phone_number, password_hash
+
+            FROM students
+
+            WHERE phone_number = ?
+        """, (phone_number,))
+
+        row = cursor.fetchone()
+
+    if row is None:
+
+        return None
+
+    return {
+
+        "id": row[0],
+
+        "name": row[1],
+
+        "phone_number": row[2],
+
+        "password_hash": row[3]
+
+    }
+
+
+def create_student(
+    name,
+    phone_number,
+    password
+):
+
+    password_hash = generate_password_hash(
+        password
+    )
+
+    with database.connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO students (
+                name,
+                phone_number,
+                password_hash,
+                created_at
+            )
+            VALUES (?, ?, ?, ?)
+        """, (
+            name,
+            phone_number,
+            password_hash,
+            datetime.now()
+        ))
+
+        conn.commit()
+
+
+def count_registered_students():
+
+    with database.connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT COUNT(*)
+
+            FROM students
+        """)
+
+        count = (
+            cursor.fetchone()[0]
+            or 0
+        )
+
+    return count
 
 
 # ================================================================
@@ -419,9 +570,9 @@ def analytics_report():
         cursor = conn.cursor()
 
         cursor.execute("""
-            SELECT COUNT(DISTINCT phone_number)
+            SELECT COUNT(*)
 
-            FROM engagement_events
+            FROM students
         """)
 
         students = (
@@ -3584,6 +3735,276 @@ BASE_HTML = """
 
 
 # ================================================================
+# STUDENT LOGIN
+# ================================================================
+
+@app.route(
+    "/login",
+    methods=["GET", "POST"]
+)
+def student_login():
+
+    error = None
+
+    if session.get("student_phone"):
+
+        return redirect(
+            url_for("test")
+        )
+
+    if request.method == "POST":
+
+        phone_number = request.form.get(
+            "phone_number", ""
+        ).strip()
+
+        password = request.form.get(
+            "password", ""
+        )
+
+        student = get_student_by_phone(
+            phone_number
+        )
+
+        if (
+            student
+
+            and check_password_hash(
+                student["password_hash"],
+                password
+            )
+
+        ):
+
+            session.clear()
+
+            session["student_phone"] = student["phone_number"]
+
+            session["student_name"] = student["name"]
+
+            return redirect(
+                url_for("test")
+            )
+
+        error = "Invalid phone number or password."
+
+    error_html = (
+        f'<div class="error">{error}</div>'
+        if error else ""
+    )
+
+    return render_template_string(
+
+        BASE_HTML,
+
+        title="EduText | Login",
+
+        content=f"""
+
+        <div class="admin-header">
+
+            <div class="admin-header-label">
+                STUDENT LOGIN
+            </div>
+
+            <h1>Welcome back</h1>
+
+            <p>Log in with your phone number and password
+            to continue learning.</p>
+
+        </div>
+
+        {error_html}
+
+        <form method="POST" class="login-card">
+
+            <label class="login-label">Phone number</label>
+            <input
+                class="login-input"
+                type="text"
+                name="phone_number"
+                autocomplete="tel"
+                required
+            >
+
+            <label class="login-label">Password</label>
+            <input
+                class="login-input"
+                type="password"
+                name="password"
+                autocomplete="current-password"
+                required
+            >
+
+            <button
+                type="submit"
+                class="primary-home-button"
+                style="width:100%; justify-content:center; margin-top:14px;"
+            >
+                Log In
+            </button>
+
+        </form>
+
+        <p style="text-align:center; margin-top:16px;">
+            Don't have an account?
+            <a href="/register">Create one</a>
+        </p>
+
+        """
+    )
+
+
+# ================================================================
+# STUDENT REGISTRATION
+# ================================================================
+
+@app.route(
+    "/register",
+    methods=["GET", "POST"]
+)
+def student_register():
+
+    error = None
+
+    if session.get("student_phone"):
+
+        return redirect(
+            url_for("test")
+        )
+
+    if request.method == "POST":
+
+        name = request.form.get(
+            "name", ""
+        ).strip()
+
+        phone_number = request.form.get(
+            "phone_number", ""
+        ).strip()
+
+        password = request.form.get(
+            "password", ""
+        )
+
+        if not name or not phone_number or not password:
+
+            error = "Please fill in all fields."
+
+        elif get_student_by_phone(phone_number):
+
+            error = "An account with this phone number already exists."
+
+        else:
+
+            create_student(
+                name,
+                phone_number,
+                password
+            )
+
+            student = get_student_by_phone(phone_number)
+
+            session.clear()
+
+            session["student_phone"] = student["phone_number"]
+
+            session["student_name"] = student["name"]
+
+            return redirect(
+                url_for("test")
+            )
+
+    error_html = (
+        f'<div class="error">{error}</div>'
+        if error else ""
+    )
+
+    return render_template_string(
+
+        BASE_HTML,
+
+        title="EduText | Create Account",
+
+        content=f"""
+
+        <div class="admin-header">
+
+            <div class="admin-header-label">
+                CREATE ACCOUNT
+            </div>
+
+            <h1>Join EduText</h1>
+
+            <p>Enter your details to create a free account.</p>
+
+        </div>
+
+        {error_html}
+
+        <form method="POST" class="login-card">
+
+            <label class="login-label">Full name</label>
+            <input
+                class="login-input"
+                type="text"
+                name="name"
+                autocomplete="name"
+                required
+            >
+
+            <label class="login-label">Phone number</label>
+            <input
+                class="login-input"
+                type="text"
+                name="phone_number"
+                autocomplete="tel"
+                required
+            >
+
+            <label class="login-label">Create a password</label>
+            <input
+                class="login-input"
+                type="password"
+                name="password"
+                autocomplete="new-password"
+                required
+            >
+
+            <button
+                type="submit"
+                class="primary-home-button"
+                style="width:100%; justify-content:center; margin-top:14px;"
+            >
+                Create Account
+            </button>
+
+        </form>
+
+        <p style="text-align:center; margin-top:16px;">
+            Already have an account?
+            <a href="/login">Log in</a>
+        </p>
+
+        """
+    )
+
+
+# ================================================================
+# STUDENT LOGOUT
+# ================================================================
+
+@app.route("/logout")
+def student_logout():
+
+    session.clear()
+
+    return redirect(
+        url_for("home")
+    )
+
+
+# ================================================================
 # TEST / QUIZ ROUTE
 # ================================================================
 
@@ -3591,11 +4012,11 @@ BASE_HTML = """
     "/test",
     methods=["GET"]
 )
+@student_login_required
 def test():
 
-    phone = request.args.get(
-        "from",
-        "+237699999999"
+    phone = session.get(
+        "student_phone"
     )
 
     text = request.args.get(
@@ -4963,7 +5384,7 @@ def admin():
 
                 <div class="analytics-label">
 
-                    STUDENTS LOGGED IN
+                    REGISTERED ACCOUNTS
 
                 </div>
 
@@ -4977,8 +5398,8 @@ def admin():
 
                 <div class="analytics-description">
 
-                    Unique students who have interacted
-                    with the platform.
+                    Total number of student accounts
+                    created on the platform.
 
                 </div>
 
