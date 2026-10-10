@@ -29,10 +29,11 @@
 # ================================================================
 
 import os
+import re
 import random
 import sqlite3
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from functools import wraps
 
@@ -45,6 +46,8 @@ from flask import (
     redirect,
     url_for
 )
+
+from markupsafe import escape
 
 from werkzeug.security import (
     check_password_hash,
@@ -61,7 +64,42 @@ from subjects import (
 # APPLICATION CONFIGURATION
 # ================================================================
 
-DATABASE_NAME = "edutext_analytics.db"
+# On a host with a temporary file system (such as a free Render web
+# service) the database file is erased on every restart or redeploy.
+# Point EDUTEXT_DB_PATH at a persistent disk to keep student accounts
+# permanently, for example: /var/data/edutext.db
+DATABASE_NAME = os.getenv(
+    "EDUTEXT_DB_PATH",
+    "edutext_analytics.db"
+)
+
+# ----------------------------------------------------------------
+# PERMANENT STORAGE WITH POSTGRES (recommended for free hosting)
+# ----------------------------------------------------------------
+# Set DATABASE_URL to the connection link of a hosted Postgres
+# database (for example from Neon or Supabase). Student accounts
+# are then stored outside Render and survive every restart and
+# redeploy. If DATABASE_URL is not set, the app falls back to the
+# local SQLite file above.
+# ----------------------------------------------------------------
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    ""
+).strip()
+
+USE_POSTGRES = DATABASE_URL.startswith(
+    ("postgres://", "postgresql://")
+)
+
+DATABASE_DIRECTORY = os.path.dirname(
+    os.path.abspath(DATABASE_NAME)
+)
+
+os.makedirs(
+    DATABASE_DIRECTORY,
+    exist_ok=True
+)
 
 HOST = "0.0.0.0"
 
@@ -84,9 +122,46 @@ app = Flask(__name__)
 # SECURITY CONFIGURATION
 # ================================================================
 
-app.secret_key = os.getenv(
-    "EDUTEXT_SECRET_KEY",
-    os.urandom(32)
+def load_secret_key():
+
+    env_key = os.getenv(
+        "EDUTEXT_SECRET_KEY"
+    )
+
+    if env_key:
+
+        return env_key
+
+    key_path = os.path.join(
+        DATABASE_DIRECTORY,
+        "edutext_secret.key"
+    )
+
+    try:
+
+        if os.path.exists(key_path):
+
+            with open(key_path) as key_file:
+
+                return key_file.read().strip()
+
+        new_key = os.urandom(32).hex()
+
+        with open(key_path, "w") as key_file:
+
+            key_file.write(new_key)
+
+        return new_key
+
+    except OSError:
+
+        return os.urandom(32).hex()
+
+
+app.secret_key = load_secret_key()
+
+app.permanent_session_lifetime = timedelta(
+    days=30
 )
 
 
@@ -181,6 +256,113 @@ def student_login_required(function):
 
 
 # ================================================================
+# POSTGRES SUPPORT
+# ================================================================
+#
+# The rest of the app was written for SQLite. These small wrappers
+# translate those queries so the same code also runs on Postgres.
+# ================================================================
+
+def translate_sql_for_postgres(sql):
+
+    sql = sql.replace("?", "%s")
+
+    sql = sql.replace(
+        "INTEGER PRIMARY KEY AUTOINCREMENT",
+        "SERIAL PRIMARY KEY"
+    )
+
+    sql = re.sub(
+        r"\bREAL\b",
+        "DOUBLE PRECISION",
+        sql
+    )
+
+    if re.search(
+        r"INSERT\s+OR\s+IGNORE\s+INTO",
+        sql,
+        re.I
+    ):
+
+        sql = re.sub(
+            r"INSERT\s+OR\s+IGNORE\s+INTO",
+            "INSERT INTO",
+            sql,
+            flags=re.I
+        )
+
+        sql = (
+            sql.rstrip().rstrip(";")
+            + " ON CONFLICT DO NOTHING"
+        )
+
+    return sql
+
+
+class PostgresCursor:
+
+    def __init__(self, raw_cursor):
+
+        self.raw = raw_cursor
+
+    def execute(self, sql, params=()):
+
+        self.raw.execute(
+            translate_sql_for_postgres(sql),
+            params
+        )
+
+        return self
+
+    def __getattr__(self, name):
+
+        return getattr(self.raw, name)
+
+
+class PostgresConnection:
+
+    def __init__(self, raw_connection):
+
+        self.raw = raw_connection
+
+    def cursor(self):
+
+        return PostgresCursor(
+            self.raw.cursor()
+        )
+
+    def execute(self, sql, params=()):
+
+        cursor = self.cursor()
+
+        cursor.execute(sql, params)
+
+        return cursor
+
+    def commit(self):
+
+        self.raw.commit()
+
+    def __enter__(self):
+
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+
+        if exc_type:
+
+            self.raw.rollback()
+
+        else:
+
+            self.raw.commit()
+
+        self.raw.close()
+
+        return False
+
+
+# ================================================================
 # DATABASE CLASS
 # ================================================================
 
@@ -199,6 +381,17 @@ class Database:
 
 
     def connection(self):
+
+        if USE_POSTGRES:
+
+            import psycopg2
+
+            return PostgresConnection(
+                psycopg2.connect(
+                    DATABASE_URL,
+                    connect_timeout=10
+                )
+            )
 
         return sqlite3.connect(
             self.database_name,
@@ -386,6 +579,169 @@ def count_registered_students():
         )
 
     return count
+
+
+# ================================================================
+# PHONE NUMBER CLEANUP
+# ================================================================
+
+def normalize_phone(value):
+
+    value = (value or "").strip()
+
+    return "".join(
+        character
+        for character in value
+        if character.isdigit() or character == "+"
+    )
+
+
+def mask_phone(value):
+
+    value = str(value)
+
+    if len(value) <= 5:
+
+        return value
+
+    return (
+        value[:3]
+        + "*" * (len(value) - 5)
+        + value[-2:]
+    )
+
+
+# ================================================================
+# LEADERBOARD
+# ================================================================
+#
+# Students are ranked by total correct answers across all completed
+# quizzes. Ties are broken by average accuracy, then fewer quizzes.
+# ================================================================
+
+def get_leaderboard():
+
+    with database.connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT
+                students.name,
+                students.phone_number,
+                COALESCE(SUM(student_sessions.score), 0),
+                COUNT(student_sessions.id),
+                COALESCE(AVG(student_sessions.accuracy_percentage), 0)
+
+            FROM students
+
+            JOIN student_sessions
+            ON student_sessions.phone_number = students.phone_number
+
+            GROUP BY students.id
+
+            ORDER BY
+                SUM(student_sessions.score) DESC,
+                AVG(student_sessions.accuracy_percentage) DESC,
+                COUNT(student_sessions.id) ASC,
+                students.name ASC
+        """)
+
+        rows = cursor.fetchall()
+
+    return [
+        {
+            "name": row[0],
+            "phone_number": row[1],
+            "points": row[2],
+            "quizzes": row[3],
+            "accuracy": round(float(row[4]), 1)
+        }
+        for row in rows
+    ]
+
+
+# ================================================================
+# ADMIN: REGISTERED STUDENT LIST
+# ================================================================
+
+def build_admin_students_html():
+
+    with database.connection() as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT
+                students.name,
+                students.phone_number,
+                students.created_at,
+                COUNT(student_sessions.id),
+                COALESCE(AVG(student_sessions.accuracy_percentage), 0)
+
+            FROM students
+
+            LEFT JOIN student_sessions
+            ON student_sessions.phone_number = students.phone_number
+
+            GROUP BY students.id
+
+            ORDER BY students.created_at DESC
+
+            LIMIT 200
+        """)
+
+        rows = cursor.fetchall()
+
+    cell = "padding:10px 8px; border-bottom:1px solid #334155;"
+
+    body = ""
+
+    for name, phone, created, quizzes, accuracy in rows:
+
+        body += (
+            "<tr>"
+            f'<td style="{cell}">{escape(name)}</td>'
+            f'<td style="{cell}">{escape(mask_phone(phone))}</td>'
+            f'<td style="{cell}">{escape(str(created)[:10])}</td>'
+            f'<td style="{cell}">{quizzes}</td>'
+            f'<td style="{cell}">{round(accuracy, 1)}%</td>'
+            "</tr>"
+        )
+
+    if not body:
+
+        body = (
+            f'<tr><td colspan="5" style="{cell}">'
+            "No students have registered yet."
+            "</td></tr>"
+        )
+
+    head = "padding:10px 8px; text-align:left; color:#94a3b8; font-size:12px;"
+
+    return (
+        '<div class="admin-info-panel" style="margin-bottom:20px;">'
+        '<div class="admin-info-title">Registered students</div>'
+        '<div style="overflow-x:auto; margin-top:12px;">'
+        '<table style="width:100%; border-collapse:collapse; font-size:14px;">'
+        "<thead><tr>"
+        f'<th style="{head}">Name</th>'
+        f'<th style="{head}">Phone</th>'
+        f'<th style="{head}">Joined</th>'
+        f'<th style="{head}">Quizzes</th>'
+        f'<th style="{head}">Accuracy</th>'
+        "</tr></thead>"
+        f"<tbody>{body}</tbody>"
+        "</table></div></div>"
+    )
+
+
+def fill_name(html, name):
+
+    return html.replace(
+        "__STUDENT_NAME__",
+        name
+    )
 
 
 # ================================================================
@@ -3742,7 +4098,7 @@ def student_login():
     if session.get("student_phone"):
 
         return redirect(
-            url_for("test")
+            url_for("home")
         )
 
     if request.method == "POST":
@@ -3750,6 +4106,8 @@ def student_login():
         phone_number = request.form.get(
             "phone_number", ""
         ).strip()
+
+        phone_number = normalize_phone(phone_number)
 
         password = request.form.get(
             "password", ""
@@ -3771,12 +4129,14 @@ def student_login():
 
             session.clear()
 
+            session.permanent = True
+
             session["student_phone"] = student["phone_number"]
 
             session["student_name"] = student["name"]
 
             return redirect(
-                url_for("test")
+                url_for("home")
             )
 
         error = "Invalid phone number or password."
@@ -3844,6 +4204,10 @@ def student_login():
             <a href="/register">Create one</a>
         </p>
 
+        <p style="text-align:center; margin-top:8px; font-size:12px;">
+            <a href="/admin/login">Administrator login</a>
+        </p>
+
         """
     )
 
@@ -3863,7 +4227,7 @@ def student_register():
     if session.get("student_phone"):
 
         return redirect(
-            url_for("test")
+            url_for("home")
         )
 
     if request.method == "POST":
@@ -3876,6 +4240,8 @@ def student_register():
             "phone_number", ""
         ).strip()
 
+        phone_number = normalize_phone(phone_number)
+
         password = request.form.get(
             "password", ""
         )
@@ -3883,6 +4249,10 @@ def student_register():
         if not name or not phone_number or not password:
 
             error = "Please fill in all fields."
+
+        elif len(password) < 6:
+
+            error = "Password must be at least 6 characters."
 
         elif get_student_by_phone(phone_number):
 
@@ -3900,12 +4270,14 @@ def student_register():
 
             session.clear()
 
+            session.permanent = True
+
             session["student_phone"] = student["phone_number"]
 
             session["student_name"] = student["name"]
 
             return redirect(
-                url_for("test")
+                url_for("home")
             )
 
     error_html = (
@@ -3994,6 +4366,121 @@ def student_logout():
 
     return redirect(
         url_for("home")
+    )
+
+
+# ================================================================
+# LEADERBOARD
+# ================================================================
+
+@app.route("/leaderboard")
+@student_login_required
+def leaderboard():
+
+    ranked = get_leaderboard()
+
+    my_phone = session.get("student_phone")
+
+    my_rank = None
+
+    for position, entry in enumerate(ranked, start=1):
+
+        if entry["phone_number"] == my_phone:
+
+            my_rank = position
+
+    cell = "padding:12px 8px; border-bottom:1px solid #334155;"
+
+    head = "padding:10px 8px; text-align:left; color:#94a3b8; font-size:12px;"
+
+    rows_html = ""
+
+    for position, entry in enumerate(ranked[:20], start=1):
+
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(position, str(position))
+
+        is_me = entry["phone_number"] == my_phone
+
+        row_style = "background:#1e3a8a;" if is_me else ""
+
+        you = " (you)" if is_me else ""
+
+        rows_html += (
+            f'<tr style="{row_style}">'
+            f'<td style="{cell}">{medal}</td>'
+            f'<td style="{cell}">{escape(entry["name"])}{you}</td>'
+            f'<td style="{cell}">{entry["points"]}</td>'
+            f'<td style="{cell}">{entry["quizzes"]}</td>'
+            f'<td style="{cell}">{entry["accuracy"]}%</td>'
+            "</tr>"
+        )
+
+    if my_rank:
+
+        summary = f"You are ranked #{my_rank} out of {len(ranked)} students."
+
+    else:
+
+        summary = "Complete a quiz to appear on the leaderboard."
+
+    if not rows_html:
+
+        rows_html = (
+            f'<tr><td colspan="5" style="{cell}">'
+            "No quizzes have been completed yet. Be the first!"
+            "</td></tr>"
+        )
+
+    return render_template_string(
+
+        BASE_HTML,
+
+        title="EduText | Leaderboard",
+
+        content=f"""
+
+        <div class="admin-header">
+
+            <div class="admin-header-label">
+                LEADERBOARD
+            </div>
+
+            <h1>Top students</h1>
+
+            <p>Ranked by total correct answers across all completed
+            quizzes. {summary}</p>
+
+        </div>
+
+        <div class="admin-info-panel" style="margin-bottom:20px;">
+
+            <div style="overflow-x:auto;">
+
+                <table style="width:100%; border-collapse:collapse; font-size:14px;">
+
+                    <thead>
+                        <tr>
+                            <th style="{head}">Rank</th>
+                            <th style="{head}">Student</th>
+                            <th style="{head}">Points</th>
+                            <th style="{head}">Quizzes</th>
+                            <th style="{head}">Accuracy</th>
+                        </tr>
+                    </thead>
+
+                    <tbody>{rows_html}</tbody>
+
+                </table>
+
+            </div>
+
+        </div>
+
+        <a class="button" href="/test?text=START">Start a Quiz</a>
+
+        <a class="button admin-back" href="/">← Back to EduText</a>
+
+        """
     )
 
 
@@ -4316,6 +4803,10 @@ def test():
                     Start New Session
                 </a>
 
+                <a class="button" href="/leaderboard" style="background:#7c3aed;">
+                    🏆 View Leaderboard
+                </a>
+
             """
 
         )
@@ -4570,13 +5061,22 @@ def test():
 @app.route("/")
 def home():
 
+    if not session.get("student_phone"):
+
+        return redirect(
+            url_for("student_login")
+        )
+
+    student_name = str(
+        escape(
+            session.get("student_name", "")
+        )
+    )
+
     return render_template_string(
-
         BASE_HTML,
-
         title="EduText | Learning Platform",
-
-        content="""
+        content=fill_name("""
 
         <div class="home-page">
 
@@ -4600,7 +5100,7 @@ def home():
 
                 <p class="hero-description">
 
-                    Welcome to EduText, your interactive learning
+                    Welcome to EduText, __STUDENT_NAME__ — your interactive learning
                     platform for practicing questions, testing your
                     knowledge and improving your accuracy.
 
@@ -4623,14 +5123,14 @@ def home():
 
                     <a
                         class="secondary-home-button"
-                        href="/admin/login"
+                        href="/leaderboard"
                     >
 
                         <span class="button-icon">
                             ◈
                         </span>
 
-                        Admin Login
+                        Leaderboard
 
                     </a>
 
@@ -4698,7 +5198,7 @@ def home():
 
 
                 <a
-                    href="/admin/login"
+                    href="/leaderboard"
                     class="feature-card"
                 >
 
@@ -4711,19 +5211,19 @@ def home():
                     <div class="feature-content">
 
                         <h3>
-                            Learning Analytics
+                            Leaderboard
                         </h3>
 
                         <p>
 
-                            Administrator access to student
-                            activity, accuracy and performance.
+                            See how you rank against other
+                            students on EduText.
 
                         </p>
 
                         <div class="feature-link purple-link">
 
-                            Admin Login
+                            View Leaderboard
 
                             <span>
                                 →
@@ -4850,13 +5350,19 @@ def home():
                     Smart learning made simple.
                 </span>
 
+                <a
+                    href="/logout"
+                    style="color:#38bdf8; text-decoration:none;"
+                >
+                    Log out
+                </a>
+
             </div>
 
 
         </div>
 
-        """
-
+        """, student_name)
     )
 
 
@@ -5261,6 +5767,8 @@ def admin():
 
     report = analytics_report()
 
+    students_html = build_admin_students_html()
+
 
     accuracy_width = min(
         max(
@@ -5584,6 +6092,8 @@ def admin():
         </div>
 
 
+        {students_html}
+
         <div class="admin-info-panel">
 
 
@@ -5735,7 +6245,9 @@ if __name__ == "__main__":
     )
 
     print(
-        DATABASE_NAME
+        "Postgres (DATABASE_URL)"
+        if USE_POSTGRES
+        else DATABASE_NAME
     )
 
     print()
